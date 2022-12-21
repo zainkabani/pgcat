@@ -494,11 +494,7 @@ impl Server {
                 'D' => {
                     // More data is available after this message, this is not the end of the reply.
                     self.data_available = true;
-
-                    // Don't flush yet, the more we buffer, the faster this goes...up to a limit.
-                    if self.buffer.len() >= 8196 {
-                        break;
-                    }
+                    break;
                 }
 
                 // CopyInResponse: copy is starting from client to server.
