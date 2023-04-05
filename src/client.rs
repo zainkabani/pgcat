@@ -8,19 +8,21 @@ use std::sync::Arc;
 use std::time::Instant;
 use tokio::io::{split, AsyncReadExt, BufReader, ReadHalf, WriteHalf};
 use tokio::net::TcpStream;
-use tokio::sync::broadcast::Receiver;
-use tokio::sync::mpsc::Sender;
+use tokio::sync::broadcast::{self, Receiver};
+use tokio::sync::mpsc;
 
 use crate::admin::{generate_server_info_for_admin, handle_admin};
 use crate::auth_passthrough::AuthPassthrough;
 use crate::config::{get_config, get_idle_client_in_transaction_timeout, Address, PoolMode};
 use crate::constants::*;
-use crate::messages::*;
+use crate::messages::{BytesMutReader, *};
 use crate::pool::{get_pool, ClientServerMap, ConnectionPool};
 use crate::query_router::{Command, QueryRouter};
 use crate::server::Server;
 use crate::stats::{ClientStats, PoolStats, ServerStats};
 use crate::tls::Tls;
+
+use std::io::Cursor;
 
 use tokio_rustls::server::TlsStream;
 
@@ -92,6 +94,9 @@ pub struct Client<S, T> {
 
     /// Used to notify clients about an impending shutdown
     shutdown: Receiver<()>,
+
+    /// In flight query
+    in_flight_query: Option<String>,
 }
 
 /// Client entrypoint.
@@ -99,7 +104,7 @@ pub async fn client_entrypoint(
     mut stream: TcpStream,
     client_server_map: ClientServerMap,
     shutdown: Receiver<()>,
-    drain: Sender<i32>,
+    drain: mpsc::Sender<i32>,
     admin_only: bool,
     tls_certificate: Option<String>,
     log_client_connections: bool,
@@ -659,6 +664,7 @@ where
             application_name: application_name.to_string(),
             shutdown,
             connected_to_server: false,
+            in_flight_query: None,
         })
     }
 
@@ -693,6 +699,7 @@ where
             application_name: String::from("undefined"),
             shutdown,
             connected_to_server: false,
+            in_flight_query: None,
         })
     }
 
@@ -900,6 +907,81 @@ where
                 Some((Command::ShowPrimaryReads, value)) => {
                     show_response(&mut self.write, "primary reads", &value).await?;
                     continue;
+                }
+            };
+
+            let caching_enabled = true;
+
+            // TODO: Need to figure out how to handle when the driving client disconnects.
+            // issues:
+            //  - We rely on the sender object to be dropped to know when the query is done
+            //    if the driving client disconnects, the sender object will not be dropped as it lives in the pool
+            // possible solutions:
+            // - To handle when a driving client disconnects we can buffer the messages the receiving clients get until a ready for query packet.
+            //   If we disconnect then we stop trying to serve cached query results and instead move on to actually executing the query.
+            //
+
+            if caching_enabled {
+                // This helps to address when the client fails to successfully drive their query to completion but retains the connection
+                // it allows us to flush the cache for that query and drop the sender (which notifies receivers that query failed)
+                match &self.in_flight_query {
+                    Some(query_string) => {
+                        // Evict the query from the in flight queries hash map and drop the old sender
+                        match pool.in_flight_queries_hash_map.get_sender(query_string) {
+                            Some(sender) => drop(sender),
+                            None => (),
+                        }
+                        self.in_flight_query = None;
+                    }
+                    None => (),
+                };
+
+                // TODO: Add more logic to determine if this is cacheable
+                // We want to cache all Q queries that don't set session state and don't begin a transaction
+                // - we can store a cache of all queries that result in a session state change or a transaction and then compare against those
+                // - we can add a comment to the query to determine if it should be cached
+
+                let mut message_cursor = Cursor::new(&message);
+
+                let code = message_cursor.get_u8() as char;
+                let _len = message_cursor.get_i32() as usize;
+
+                if code == 'Q' {
+                    let query = message_cursor.read_string().unwrap();
+                    println!("Got query: {}", query);
+                    match pool.in_flight_queries_hash_map.get_receiver(query.clone()) {
+                        Some(mut receiver) => {
+                            // This client will listen for the query to complete
+                            println!("Got a match");
+                            loop {
+                                match receiver.recv().await {
+                                    Ok(message) => {
+                                        println!("Got a message");
+                                        match write_all_half(&mut self.write, &message).await {
+                                            Ok(_) => {
+                                                self.stats.query();
+                                            }
+                                            Err(err) => {
+                                                println!("Error: {:?}", err);
+                                                break;
+                                            }
+                                        }
+                                    }
+                                    Err(broadcast::error::RecvError::Closed) => {
+                                        break;
+                                    }
+                                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                                        todo!() // TODO: Unclear how to handle errors here
+                                    }
+                                }
+                            }
+                        }
+                        None => {
+                            // This client will drive the execution of the query
+                            pool.in_flight_queries_hash_map.create_sender(&query);
+                            self.in_flight_query = Some(query);
+                        }
+                    }
                 }
             };
 
@@ -1136,7 +1218,7 @@ where
                         // Want to limit buffer size
                         if self.buffer.len() > 8196 {
                             // Forward the data to the server,
-                            self.send_server_message(server, &self.buffer, &address, &pool)
+                            self.send_message_to_server(server, &self.buffer, &address, &pool)
                                 .await?;
                             self.buffer.clear();
                         }
@@ -1148,14 +1230,19 @@ where
                         // We may already have some copy data in the buffer, add this message to buffer
                         self.buffer.put(&message[..]);
 
-                        self.send_server_message(server, &self.buffer, &address, &pool)
+                        self.send_message_to_server(server, &self.buffer, &address, &pool)
                             .await?;
 
                         // Clear the buffer
                         self.buffer.clear();
 
                         let response = self
-                            .receive_server_message(server, &address, &pool, &self.stats.clone())
+                            .receive_message_from_server(
+                                server,
+                                &address,
+                                &pool,
+                                &self.stats.clone(),
+                            )
                             .await?;
 
                         match write_all_half(&mut self.write, &response).await {
@@ -1235,22 +1322,25 @@ where
         pool: &ConnectionPool,
         client_stats: &ClientStats,
     ) -> Result<(), Error> {
-        debug!("Sending {} to server", code);
+        println!("Sending {} to server", code);
 
         let message = match message {
             Some(message) => message,
             None => &self.buffer,
         };
 
-        self.send_server_message(server, message, address, pool)
+        self.send_message_to_server(server, message, address, pool)
             .await?;
 
         let query_start = Instant::now();
         // Read all data the server has to offer, which can be multiple messages
         // buffered in 8196 bytes chunks.
+
+        let mut sender: Option<broadcast::Sender<BytesMut>> = None;
+
         loop {
             let response = self
-                .receive_server_message(server, address, pool, client_stats)
+                .receive_message_from_server(server, address, pool, client_stats)
                 .await?;
 
             match write_all_half(&mut self.write, &response).await {
@@ -1260,6 +1350,22 @@ where
                     return Err(err);
                 }
             };
+
+            if self.in_flight_query.is_some() {
+                let query_string = self.in_flight_query.as_ref().unwrap();
+                match pool.in_flight_queries_hash_map.get_sender(query_string) {
+                    Some(s) => sender = Some(s),
+                    None => (),
+                };
+                self.in_flight_query = None;
+            }
+
+            match &sender {
+                Some(s) => {
+                    let _ = s.send(response);
+                }
+                None => (),
+            }
 
             if !server.is_data_available() {
                 break;
@@ -1276,7 +1382,7 @@ where
         Ok(())
     }
 
-    async fn send_server_message(
+    async fn send_message_to_server(
         &self,
         server: &mut Server,
         message: &BytesMut,
@@ -1292,7 +1398,7 @@ where
         }
     }
 
-    async fn receive_server_message(
+    async fn receive_message_from_server(
         &mut self,
         server: &mut Server,
         address: &Address,

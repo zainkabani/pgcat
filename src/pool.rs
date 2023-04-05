@@ -15,7 +15,8 @@ use std::sync::{
     Arc,
 };
 use std::time::Instant;
-use tokio::sync::Notify;
+use tokio::sync::broadcast::Sender;
+use tokio::sync::{broadcast, Notify};
 
 use crate::config::{get_config, Address, General, LoadBalancingMode, PoolMode, Role, User};
 use crate::errors::Error;
@@ -38,6 +39,41 @@ pub type PoolMap = HashMap<PoolIdentifier, ConnectionPool>;
 /// This is atomic and safe and read-optimized.
 /// The pool is recreated dynamically when the config is reloaded.
 pub static POOLS: Lazy<ArcSwap<PoolMap>> = Lazy::new(|| ArcSwap::from_pointee(HashMap::default()));
+
+#[derive(Debug, Default)]
+pub struct InFlightQueryHashMap {
+    map: RwLock<HashMap<String, broadcast::Sender<BytesMut>>>,
+}
+
+impl InFlightQueryHashMap {
+    pub fn new() -> Self {
+        Self {
+            map: RwLock::new(HashMap::new()),
+        }
+    }
+
+    pub fn create_sender(&self, query: &String) -> Sender<BytesMut> {
+        let (sender, _) = broadcast::channel(100);
+        let mut write_guard = self.map.write();
+        write_guard.insert(query.to_string(), sender.clone());
+
+        sender
+    }
+
+    pub fn get_receiver(&self, query: String) -> Option<broadcast::Receiver<BytesMut>> {
+        let read_guard = self.map.read();
+        if let Some(sender) = read_guard.get(&query) {
+            return Some(sender.subscribe());
+        }
+
+        None
+    }
+
+    pub fn get_sender(&self, query: &String) -> Option<broadcast::Sender<BytesMut>> {
+        let mut write_guard = self.map.write();
+        write_guard.remove(query)
+    }
+}
 
 // Reasons for banning a server.
 #[derive(Debug, PartialEq, Clone)]
@@ -195,6 +231,8 @@ pub struct ConnectionPool {
 
     /// AuthInfo
     pub auth_hash: Arc<RwLock<Option<String>>>,
+
+    pub in_flight_queries_hash_map: Arc<InFlightQueryHashMap>,
 }
 
 impl ConnectionPool {
@@ -416,6 +454,7 @@ impl ConnectionPool {
                     validated: Arc::new(AtomicBool::new(false)),
                     paused: Arc::new(AtomicBool::new(false)),
                     paused_waiter: Arc::new(Notify::new()),
+                    in_flight_queries_hash_map: Arc::new(InFlightQueryHashMap::new()),
                 };
 
                 // Connect to the servers to make sure pool configuration is valid
