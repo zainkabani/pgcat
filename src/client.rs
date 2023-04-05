@@ -919,7 +919,13 @@ where
             // possible solutions:
             // - To handle when a driving client disconnects we can buffer the messages the receiving clients get until a ready for query packet.
             //   If we disconnect then we stop trying to serve cached query results and instead move on to actually executing the query.
-            //
+            // - create a wrapper around sender to keep a count of how many senders there are.
+            //   we can clone the sender and give it to the client. if the client drops the sender we decrement the count.
+            //   in a normal case we will have a client sender and a cache sender. if the client drops the sender we will only have the cache sender.
+            //   when the count is 1 we know that something has gone wrong with the original sender and we can evict it from the cache.
+            //   this could be a tokio task that checks the cache or we can do this when we have a query cache hit check and we're searching to see if a sender exists
+            //   This is a more reactive approach than proactive and could result in clients waiting for query results that will never come.
+            // - Move the logic that sends the cached query results to the client into the pool/server side so there's no dependency on the client
 
             if caching_enabled {
                 // This helps to address when the client fails to successfully drive their query to completion but retains the connection
@@ -975,6 +981,7 @@ where
                                     }
                                 }
                             }
+                            continue;
                         }
                         None => {
                             // This client will drive the execution of the query
