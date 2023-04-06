@@ -954,10 +954,11 @@ where
                                             Err(err) => return Err(err),
                                         },
                                         Err(broadcast::error::RecvError::Closed) => {
+                                            println!("Channel closed");
                                             break;
                                         }
                                         Err(broadcast::error::RecvError::Lagged(_)) => {
-                                            todo!() // TODO: Unclear how to handle errors here
+                                            todo!() // TODO: Unclear how to handle errors here, likely shouldn't get here
                                         }
                                     }
                                 }
@@ -968,7 +969,7 @@ where
                                 println!("No match, creating sender");
                                 let (driving_client_sender, driving_client_receiver) =
                                     broadcast::channel(100);
-                                inflight_hashmap.insert_into_cache(&query, driving_client_receiver);
+                                inflight_hashmap.insert_into_cache(query, driving_client_receiver);
                                 Some(driving_client_sender)
                                 // pool.in_flight_queries_hash_map.create_sender(&query);
                                 // self.in_flight_query = Some(query);
@@ -1323,7 +1324,7 @@ where
         address: &Address,
         pool: &ConnectionPool,
         client_stats: &ClientStats,
-        cache_sender: &Option<broadcast::Sender<Result<BytesMut, Error>>>,
+        mut cache_sender: &Option<broadcast::Sender<Result<BytesMut, Error>>>,
     ) -> Result<(), Error> {
         debug!("Sending {} to server", code);
 
@@ -1342,21 +1343,33 @@ where
         loop {
             let response = self
                 .receive_message_from_server(server, address, pool, client_stats)
-                .await?;
+                .await;
 
-            match write_all_half(&mut self.write, &response).await {
-                Ok(_) => (),
-                Err(err) => {
-                    server.mark_bad();
-                    return Err(err);
-                }
-            };
-
+            // We want to send to cache first to avoid any race conditions with this client closing too fast
             match cache_sender {
                 Some(s) => {
-                    let _ = s.send(Ok(response));
+                    // This means our receiver has been dropped, so we can stop trying to send the messages to it.
+                    if s.send(response.clone()).is_err() {
+                        drop(cache_sender);
+                        cache_sender = &None;
+                    };
                 }
                 None => (),
+            }
+
+            match response {
+                Ok(message_bytes) => {
+                    match write_all_half(&mut self.write, &message_bytes).await {
+                        Ok(_) => (),
+                        Err(err) => {
+                            server.mark_bad(); // Mark bad because the server connection is in a weird state mid query.
+                            return Err(err);
+                        }
+                    };
+                }
+                Err(err) => {
+                    return Err(err);
+                }
             }
 
             if !server.is_data_available() {

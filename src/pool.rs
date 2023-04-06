@@ -53,58 +53,71 @@ impl InFlightQueryHashMap {
 
     pub fn insert_into_cache(
         self: Arc<Self>,
-        query: &String,
+        query: String,
         mut driving_client_receiver: broadcast::Receiver<Result<BytesMut, Error>>,
     ) {
         let mut write_guard = self.map.write();
 
         // Create a new channel for new clients that will be waiting for this query
         let (sender_for_new_clients, _) = broadcast::channel(100); // Consider this number
-        write_guard.insert(query.to_string(), sender_for_new_clients);
+        write_guard.insert(query.clone(), sender_for_new_clients);
         drop(write_guard);
 
-        let my_query = query.clone();
         // This will take messages from the driver and send them to each receiver waiting for a query
         tokio::spawn(async move {
-            let me = Arc::clone(&self);
-            let query = my_query;
-
-            let mut waiting_client_sender: Option<broadcast::Sender<Result<BytesMut, Error>>> = None;
+            let mut waiting_client_sender: Option<broadcast::Sender<Result<BytesMut, Error>>> =
+                None;
 
             loop {
                 println!("Waiting for message from driver...");
                 match driving_client_receiver.recv().await {
                     Ok(message_result) => {
-
                         println!("Got message from driver!");
 
-                        match &waiting_client_sender {
-                            Some(s) => {
-                                let _ = s.send(message_result);
-                                println!("Sent message to all receivers!");
-                            }
-                            None => {
-                                // We want to evict the query from the cache as soon as we receive the first message from postgres
-                                // We want to avoid sending partial messages in case new clients sign up with the same query and get the partial message
-                                waiting_client_sender = me.evict_client_waiting_sender(&query);
-                            },
+                        // The only way we get this value is when we evict it from the cache
+                        if waiting_client_sender.is_none() {
+                            // We want to evict the query from the cache as soon as we receive the first message from postgres
+                            // We want to avoid sending partial messages in case new clients sign up with the same query and get the partial message
+                            match self.evict_client_waiting_sender(&query) {
+                                Some(s) => {
+                                    println!("Removed query from cache!");
+
+                                    // No need for this tokio task as we don't have any receivers
+                                    if s.receiver_count() == 0 {
+                                        println!("No receivers to send message to!");
+                                        break;
+                                    }
+
+                                    waiting_client_sender = Some(s);
+                                }
+                                None => {
+                                    // We won't be able to send the message to any receivers
+                                    // we shouldn't be able to get here
+                                    println!("Could not find query in cache!");
+                                    break;
+                                }
+                            };
+                        }
+
+                        if let Some(s) = &waiting_client_sender {
+                            println!("Sending message to all receivers!");
+                            let _ = s.send(message_result);
+                            println!("Sent message to all receivers!");
                         }
                     }
                     Err(_) => {
                         println!("Driver disconnected!");
+                        // Remove the query from the cache if the driver disconnected without sending a message
+                        if waiting_client_sender.is_none() {
+                            println!("Removed query from cache!");
+                            self.evict_client_waiting_sender(&query);
+                        }
                         break;
                     }
                 };
             }
-
-            // Remove the query from the cache if the driver disconnected without sending a message
-            if waiting_client_sender.is_none() {
-                println!("Removed query from cache!");
-                me.evict_client_waiting_sender(&query);
-            }
         });
     }
-
 
     pub fn get_receiver(
         &self,
@@ -118,7 +131,10 @@ impl InFlightQueryHashMap {
         }
     }
 
-    pub fn evict_client_waiting_sender(&self, query: &String) -> Option<broadcast::Sender<Result<BytesMut, Error>>> {
+    pub fn evict_client_waiting_sender(
+        &self,
+        query: &String,
+    ) -> Option<broadcast::Sender<Result<BytesMut, Error>>> {
         let mut write_guard = self.map.write();
         write_guard.remove(query)
     }
