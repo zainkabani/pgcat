@@ -1,7 +1,7 @@
 /// Errors.
 
 /// Various errors.
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone)]
 pub enum Error {
     SocketError(String),
     ClientBadStartup,

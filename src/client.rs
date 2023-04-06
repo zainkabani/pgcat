@@ -94,9 +94,6 @@ pub struct Client<S, T> {
 
     /// Used to notify clients about an impending shutdown
     shutdown: Receiver<()>,
-
-    /// In flight query
-    in_flight_query: Option<String>,
 }
 
 /// Client entrypoint.
@@ -664,7 +661,6 @@ where
             application_name: application_name.to_string(),
             shutdown,
             connected_to_server: false,
-            in_flight_query: None,
         })
     }
 
@@ -699,7 +695,6 @@ where
             application_name: String::from("undefined"),
             shutdown,
             connected_to_server: false,
-            in_flight_query: None,
         })
     }
 
@@ -912,84 +907,78 @@ where
 
             let caching_enabled = true;
 
+            // TODO: Consider if we should support this in session mode or not
+
             // TODO: Need to figure out how to handle when the driving client disconnects.
-            // issues:
-            //  - We rely on the sender object to be dropped to know when the query is done
-            //    if the driving client disconnects, the sender object will not be dropped as it lives in the pool
-            // possible solutions:
-            // - To handle when a driving client disconnects we can buffer the messages the receiving clients get until a ready for query packet.
-            //   If we disconnect then we stop trying to serve cached query results and instead move on to actually executing the query.
-            // - create a wrapper around sender to keep a count of how many senders there are.
-            //   we can clone the sender and give it to the client. if the client drops the sender we decrement the count.
-            //   in a normal case we will have a client sender and a cache sender. if the client drops the sender we will only have the cache sender.
-            //   when the count is 1 we know that something has gone wrong with the original sender and we can evict it from the cache.
-            //   this could be a tokio task that checks the cache or we can do this when we have a query cache hit check and we're searching to see if a sender exists
-            //   This is a more reactive approach than proactive and could result in clients waiting for query results that will never come.
-            // - Move the logic that sends the cached query results to the client into the pool/server side so there's no dependency on the client
+            // We need to determine if the query completed or not and if it didn't we need to
+            // execute it normally.
 
-            if caching_enabled {
-                // This helps to address when the client fails to successfully drive their query to completion but retains the connection
-                // it allows us to flush the cache for that query and drop the sender (which notifies receivers that query failed)
-                match &self.in_flight_query {
-                    Some(query_string) => {
-                        // Evict the query from the in flight queries hash map and drop the old sender
-                        match pool.in_flight_queries_hash_map.get_sender(query_string) {
-                            Some(sender) => drop(sender),
-                            None => (),
-                        }
-                        self.in_flight_query = None;
-                    }
-                    None => (),
-                };
+            let mut cache_sender = match caching_enabled {
+                true => {
+                    // TODO: Add more logic to determine if a message is cacheable
+                    // We want to cache all Q queries that don't set session state and don't begin a transaction
+                    // - we can store a cache of all queries that result in a session state change or a transaction and then compare against those
+                    // - we can add a comment to the query to determine if it should be cached
 
-                // TODO: Add more logic to determine if this is cacheable
-                // We want to cache all Q queries that don't set session state and don't begin a transaction
-                // - we can store a cache of all queries that result in a session state change or a transaction and then compare against those
-                // - we can add a comment to the query to determine if it should be cached
+                    let mut message_cursor = Cursor::new(&message);
 
-                let mut message_cursor = Cursor::new(&message);
+                    let code = message_cursor.get_u8() as char;
+                    let _len = message_cursor.get_i32() as usize;
 
-                let code = message_cursor.get_u8() as char;
-                let _len = message_cursor.get_i32() as usize;
+                    let inflight_hashmap = pool.in_flight_queries_hash_map.clone();
 
-                if code == 'Q' {
-                    let query = message_cursor.read_string().unwrap();
-                    println!("Got query: {}", query);
-                    match pool.in_flight_queries_hash_map.get_receiver(query.clone()) {
-                        Some(mut receiver) => {
-                            // This client will listen for the query to complete
-                            println!("Got a match");
-                            loop {
-                                match receiver.recv().await {
-                                    Ok(message) => {
-                                        println!("Got a message");
-                                        match write_all_half(&mut self.write, &message).await {
-                                            Ok(_) => {
-                                                self.stats.query();
+                    if code == 'Q' {
+                        let query = message_cursor.read_string().unwrap();
+                        println!("Got query: {}", query);
+                        match inflight_hashmap.get_receiver(&query) {
+                            Some(mut receiver) => {
+                                // This client will listen for the query to complete
+                                println!("Got a match");
+                                loop {
+                                    match receiver.recv().await {
+                                        Ok(result) => match result {
+                                            Ok(message) => {
+                                                println!("Got a message");
+                                                match write_all_half(&mut self.write, &message)
+                                                    .await
+                                                {
+                                                    Ok(_) => {
+                                                        self.stats.query();
+                                                    }
+                                                    Err(err) => {
+                                                        println!("Error: {:?}", err);
+                                                        break;
+                                                    }
+                                                }
                                             }
-                                            Err(err) => {
-                                                println!("Error: {:?}", err);
-                                                break;
-                                            }
+                                            Err(err) => return Err(err),
+                                        },
+                                        Err(broadcast::error::RecvError::Closed) => {
+                                            break;
+                                        }
+                                        Err(broadcast::error::RecvError::Lagged(_)) => {
+                                            todo!() // TODO: Unclear how to handle errors here
                                         }
                                     }
-                                    Err(broadcast::error::RecvError::Closed) => {
-                                        break;
-                                    }
-                                    Err(broadcast::error::RecvError::Lagged(_)) => {
-                                        todo!() // TODO: Unclear how to handle errors here
-                                    }
                                 }
+                                continue;
                             }
-                            continue;
+                            None => {
+                                // This client will drive the execution of the query
+                                println!("No match, creating sender");
+                                let (driving_client_sender, driving_client_receiver) =
+                                    broadcast::channel(100);
+                                inflight_hashmap.insert_into_cache(&query, driving_client_receiver);
+                                Some(driving_client_sender)
+                                // pool.in_flight_queries_hash_map.create_sender(&query);
+                                // self.in_flight_query = Some(query);
+                            }
                         }
-                        None => {
-                            // This client will drive the execution of the query
-                            pool.in_flight_queries_hash_map.create_sender(&query);
-                            self.in_flight_query = Some(query);
-                        }
+                    } else {
+                        None
                     }
                 }
+                false => None,
             };
 
             debug!("Waiting for connection from pool");
@@ -1070,6 +1059,10 @@ where
                     None => {
                         trace!("Waiting for message inside transaction or in session mode");
 
+                        // This is necessary to terminate the tokio task for caching if it's running.
+                        drop(cache_sender);
+                        cache_sender = None;
+
                         match tokio::time::timeout(
                             idle_client_timeout_duration,
                             read_message(&mut self.read),
@@ -1120,6 +1113,7 @@ where
                             &address,
                             &pool,
                             &self.stats.clone(),
+                            &cache_sender,
                         )
                         .await?;
 
@@ -1201,6 +1195,7 @@ where
                             &address,
                             &pool,
                             &self.stats.clone(),
+                            &None, // TODO: Support caching for prepared statements
                         )
                         .await?;
 
@@ -1328,8 +1323,9 @@ where
         address: &Address,
         pool: &ConnectionPool,
         client_stats: &ClientStats,
+        cache_sender: &Option<broadcast::Sender<Result<BytesMut, Error>>>,
     ) -> Result<(), Error> {
-        println!("Sending {} to server", code);
+        debug!("Sending {} to server", code);
 
         let message = match message {
             Some(message) => message,
@@ -1342,8 +1338,6 @@ where
         let query_start = Instant::now();
         // Read all data the server has to offer, which can be multiple messages
         // buffered in 8196 bytes chunks.
-
-        let mut sender: Option<broadcast::Sender<BytesMut>> = None;
 
         loop {
             let response = self
@@ -1358,18 +1352,9 @@ where
                 }
             };
 
-            if self.in_flight_query.is_some() {
-                let query_string = self.in_flight_query.as_ref().unwrap();
-                match pool.in_flight_queries_hash_map.get_sender(query_string) {
-                    Some(s) => sender = Some(s),
-                    None => (),
-                };
-                self.in_flight_query = None;
-            }
-
-            match &sender {
+            match cache_sender {
                 Some(s) => {
-                    let _ = s.send(response);
+                    let _ = s.send(Ok(response));
                 }
                 None => (),
             }
@@ -1412,38 +1397,13 @@ where
         pool: &ConnectionPool,
         client_stats: &ClientStats,
     ) -> Result<BytesMut, Error> {
-        if pool.settings.user.statement_timeout > 0 {
-            match tokio::time::timeout(
-                tokio::time::Duration::from_millis(pool.settings.user.statement_timeout),
-                server.recv(),
-            )
-            .await
-            {
-                Ok(result) => match result {
-                    Ok(message) => Ok(message),
-                    Err(err) => {
-                        pool.ban(address, BanReason::MessageReceiveFailed, Some(client_stats));
-                        error_response_terminal(
-                            &mut self.write,
-                            &format!("error receiving data from server: {:?}", err),
-                        )
-                        .await?;
-                        Err(err)
-                    }
-                },
-                Err(_) => {
-                    error!(
-                        "Statement timeout while talking to {:?} with user {}",
-                        address, pool.settings.user.username
-                    );
-                    server.mark_bad();
-                    pool.ban(address, BanReason::StatementTimeout, Some(client_stats));
-                    error_response_terminal(&mut self.write, "pool statement timeout").await?;
-                    Err(Error::StatementTimeout)
-                }
-            }
-        } else {
-            match server.recv().await {
+        let statement_timeout = match pool.settings.user.statement_timeout {
+            0 => tokio::time::Duration::MAX,
+            timeout => tokio::time::Duration::from_millis(timeout),
+        };
+
+        match tokio::time::timeout(statement_timeout, server.recv()).await {
+            Ok(result) => match result {
                 Ok(message) => Ok(message),
                 Err(err) => {
                     pool.ban(address, BanReason::MessageReceiveFailed, Some(client_stats));
@@ -1454,6 +1414,16 @@ where
                     .await?;
                     Err(err)
                 }
+            },
+            Err(_) => {
+                error!(
+                    "Statement timeout while talking to {:?} with user {}",
+                    address, pool.settings.user.username
+                );
+                server.mark_bad();
+                pool.ban(address, BanReason::StatementTimeout, Some(client_stats));
+                error_response_terminal(&mut self.write, "pool statement timeout").await?;
+                Err(Error::StatementTimeout)
             }
         }
     }

@@ -15,7 +15,6 @@ use std::sync::{
     Arc,
 };
 use std::time::Instant;
-use tokio::sync::broadcast::Sender;
 use tokio::sync::{broadcast, Notify};
 
 use crate::config::{get_config, Address, General, LoadBalancingMode, PoolMode, Role, User};
@@ -42,7 +41,7 @@ pub static POOLS: Lazy<ArcSwap<PoolMap>> = Lazy::new(|| ArcSwap::from_pointee(Ha
 
 #[derive(Debug, Default)]
 pub struct InFlightQueryHashMap {
-    map: RwLock<HashMap<String, broadcast::Sender<BytesMut>>>,
+    map: RwLock<HashMap<String, broadcast::Sender<Result<BytesMut, Error>>>>,
 }
 
 impl InFlightQueryHashMap {
@@ -52,26 +51,60 @@ impl InFlightQueryHashMap {
         }
     }
 
-    pub fn create_sender(&self, query: &String) -> Sender<BytesMut> {
-        let (sender, _) = broadcast::channel(100);
+    pub fn insert_into_cache(
+        self: Arc<Self>,
+        query: &String,
+        mut driving_client_receiver: broadcast::Receiver<Result<BytesMut, Error>>,
+    ) {
         let mut write_guard = self.map.write();
-        write_guard.insert(query.to_string(), sender.clone());
 
-        sender
+        // Create a new channel for new clients that will be waiting for this query
+        let (sender_for_new_clients, _) = broadcast::channel(100); // Consider this number
+        write_guard.insert(query.to_string(), sender_for_new_clients);
+        drop(write_guard);
+
+        let my_query = query.clone();
+        // This will take messages from the driver and send them to each receiver waiting for a query
+        tokio::spawn(async move {
+            let me = Arc::clone(&self);
+            let query = my_query;
+            loop {
+                println!("Waiting for message from driver...");
+                match driving_client_receiver.recv().await {
+                    Ok(message_result) => {
+                        println!("Got message from driver!");
+                        let read_guard = me.map.read();
+                        if let Some(s) = read_guard.get(&query) {
+                            let _ = s.send(message_result);
+                            println!("Sent message to all receivers!");
+                        }
+                    }
+                    Err(_) => {
+                        println!("Driver disconnected!");
+                        break;
+                    }
+                };
+            }
+
+            // Remove the query from the cache
+            let mut write_guard = me.map.write();
+            write_guard.remove(&query);
+
+            println!("Removed query from cache!")
+        });
     }
 
-    pub fn get_receiver(&self, query: String) -> Option<broadcast::Receiver<BytesMut>> {
+
+    pub fn get_receiver(
+        &self,
+        query: &String,
+    ) -> Option<broadcast::Receiver<Result<BytesMut, Error>>> {
         let read_guard = self.map.read();
-        if let Some(sender) = read_guard.get(&query) {
+        if let Some(sender) = read_guard.get(query) {
             return Some(sender.subscribe());
+        } else {
+            return None;
         }
-
-        None
-    }
-
-    pub fn get_sender(&self, query: &String) -> Option<broadcast::Sender<BytesMut>> {
-        let mut write_guard = self.map.write();
-        write_guard.remove(query)
     }
 }
 
