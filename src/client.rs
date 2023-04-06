@@ -8,19 +8,21 @@ use std::sync::Arc;
 use std::time::Instant;
 use tokio::io::{split, AsyncReadExt, BufReader, ReadHalf, WriteHalf};
 use tokio::net::TcpStream;
-use tokio::sync::broadcast::Receiver;
-use tokio::sync::mpsc::Sender;
+use tokio::sync::broadcast::{self, Receiver};
+use tokio::sync::mpsc;
 
 use crate::admin::{generate_server_info_for_admin, handle_admin};
 use crate::auth_passthrough::AuthPassthrough;
 use crate::config::{get_config, get_idle_client_in_transaction_timeout, Address, PoolMode};
 use crate::constants::*;
-use crate::messages::*;
+use crate::messages::{BytesMutReader, *};
 use crate::pool::{get_pool, ClientServerMap, ConnectionPool};
 use crate::query_router::{Command, QueryRouter};
 use crate::server::Server;
 use crate::stats::{ClientStats, PoolStats, ServerStats};
 use crate::tls::Tls;
+
+use std::io::Cursor;
 
 use tokio_rustls::server::TlsStream;
 
@@ -99,7 +101,7 @@ pub async fn client_entrypoint(
     mut stream: TcpStream,
     client_server_map: ClientServerMap,
     shutdown: Receiver<()>,
-    drain: Sender<i32>,
+    drain: mpsc::Sender<i32>,
     admin_only: bool,
     tls_certificate: Option<String>,
     log_client_connections: bool,
@@ -903,6 +905,83 @@ where
                 }
             };
 
+            let caching_enabled = true;
+
+            // TODO: Consider if we should support this in session mode or not
+
+            // TODO: Need to figure out how to handle when the driving client disconnects.
+            // We need to determine if the query completed or not and if it didn't we need to
+            // execute it normally.
+
+            let mut cache_sender = match caching_enabled {
+                true => {
+                    // TODO: Add more logic to determine if a message is cacheable
+                    // We want to cache all Q queries that don't set session state and don't begin a transaction
+                    // - we can store a cache of all queries that result in a session state change or a transaction and then compare against those
+                    // - we can add a comment to the query to determine if it should be cached
+
+                    let mut message_cursor = Cursor::new(&message);
+
+                    let code = message_cursor.get_u8() as char;
+                    let _len = message_cursor.get_i32() as usize;
+
+                    let inflight_hashmap = pool.in_flight_queries_hash_map.clone();
+
+                    if code == 'Q' {
+                        let query = message_cursor.read_string().unwrap();
+                        println!("Got query: {}", query);
+                        match inflight_hashmap.get_receiver(&query) {
+                            Some(mut receiver) => {
+                                // This client will listen for the query to complete
+                                println!("Got a match");
+                                loop {
+                                    match receiver.recv().await {
+                                        Ok(result) => match result {
+                                            Ok(message) => {
+                                                println!("Got a message");
+                                                match write_all_half(&mut self.write, &message)
+                                                    .await
+                                                {
+                                                    Ok(_) => {
+                                                        self.stats.query();
+                                                    }
+                                                    Err(err) => {
+                                                        println!("Error: {:?}", err);
+                                                        break;
+                                                    }
+                                                }
+                                            }
+                                            Err(err) => return Err(err),
+                                        },
+                                        Err(broadcast::error::RecvError::Closed) => {
+                                            println!("Channel closed");
+                                            break;
+                                        }
+                                        Err(broadcast::error::RecvError::Lagged(_)) => {
+                                            todo!() // TODO: Unclear how to handle errors here, likely shouldn't get here
+                                        }
+                                    }
+                                }
+                                continue;
+                            }
+                            None => {
+                                // This client will drive the execution of the query
+                                println!("No match, creating sender");
+                                let (driving_client_sender, driving_client_receiver) =
+                                    broadcast::channel(100);
+                                inflight_hashmap.insert_into_cache(query, driving_client_receiver);
+                                Some(driving_client_sender)
+                                // pool.in_flight_queries_hash_map.create_sender(&query);
+                                // self.in_flight_query = Some(query);
+                            }
+                        }
+                    } else {
+                        None
+                    }
+                }
+                false => None,
+            };
+
             debug!("Waiting for connection from pool");
             if !self.admin {
                 self.stats.waiting();
@@ -981,6 +1060,10 @@ where
                     None => {
                         trace!("Waiting for message inside transaction or in session mode");
 
+                        // This is necessary to terminate the tokio task for caching if it's running.
+                        drop(cache_sender);
+                        cache_sender = None;
+
                         match tokio::time::timeout(
                             idle_client_timeout_duration,
                             read_message(&mut self.read),
@@ -1031,6 +1114,7 @@ where
                             &address,
                             &pool,
                             &self.stats.clone(),
+                            &cache_sender,
                         )
                         .await?;
 
@@ -1112,6 +1196,7 @@ where
                             &address,
                             &pool,
                             &self.stats.clone(),
+                            &None, // TODO: Support caching for prepared statements
                         )
                         .await?;
 
@@ -1136,7 +1221,7 @@ where
                         // Want to limit buffer size
                         if self.buffer.len() > 8196 {
                             // Forward the data to the server,
-                            self.send_server_message(server, &self.buffer, &address, &pool)
+                            self.send_message_to_server(server, &self.buffer, &address, &pool)
                                 .await?;
                             self.buffer.clear();
                         }
@@ -1148,14 +1233,19 @@ where
                         // We may already have some copy data in the buffer, add this message to buffer
                         self.buffer.put(&message[..]);
 
-                        self.send_server_message(server, &self.buffer, &address, &pool)
+                        self.send_message_to_server(server, &self.buffer, &address, &pool)
                             .await?;
 
                         // Clear the buffer
                         self.buffer.clear();
 
                         let response = self
-                            .receive_server_message(server, &address, &pool, &self.stats.clone())
+                            .receive_message_from_server(
+                                server,
+                                &address,
+                                &pool,
+                                &self.stats.clone(),
+                            )
                             .await?;
 
                         match write_all_half(&mut self.write, &response).await {
@@ -1234,6 +1324,7 @@ where
         address: &Address,
         pool: &ConnectionPool,
         client_stats: &ClientStats,
+        mut cache_sender: &Option<broadcast::Sender<Result<BytesMut, Error>>>,
     ) -> Result<(), Error> {
         debug!("Sending {} to server", code);
 
@@ -1242,24 +1333,44 @@ where
             None => &self.buffer,
         };
 
-        self.send_server_message(server, message, address, pool)
+        self.send_message_to_server(server, message, address, pool)
             .await?;
 
         let query_start = Instant::now();
         // Read all data the server has to offer, which can be multiple messages
         // buffered in 8196 bytes chunks.
+
         loop {
             let response = self
-                .receive_server_message(server, address, pool, client_stats)
-                .await?;
+                .receive_message_from_server(server, address, pool, client_stats)
+                .await;
 
-            match write_all_half(&mut self.write, &response).await {
-                Ok(_) => (),
+            // We want to send to cache first to avoid any race conditions with this client closing too fast
+            match cache_sender {
+                Some(s) => {
+                    // This means our receiver has been dropped, so we can stop trying to send the messages to it.
+                    if s.send(response.clone()).is_err() {
+                        drop(cache_sender);
+                        cache_sender = &None;
+                    };
+                }
+                None => (),
+            }
+
+            match response {
+                Ok(message_bytes) => {
+                    match write_all_half(&mut self.write, &message_bytes).await {
+                        Ok(_) => (),
+                        Err(err) => {
+                            server.mark_bad(); // Mark bad because the server connection is in a weird state mid query.
+                            return Err(err);
+                        }
+                    };
+                }
                 Err(err) => {
-                    server.mark_bad();
                     return Err(err);
                 }
-            };
+            }
 
             if !server.is_data_available() {
                 break;
@@ -1276,7 +1387,7 @@ where
         Ok(())
     }
 
-    async fn send_server_message(
+    async fn send_message_to_server(
         &self,
         server: &mut Server,
         message: &BytesMut,
@@ -1292,45 +1403,20 @@ where
         }
     }
 
-    async fn receive_server_message(
+    async fn receive_message_from_server(
         &mut self,
         server: &mut Server,
         address: &Address,
         pool: &ConnectionPool,
         client_stats: &ClientStats,
     ) -> Result<BytesMut, Error> {
-        if pool.settings.user.statement_timeout > 0 {
-            match tokio::time::timeout(
-                tokio::time::Duration::from_millis(pool.settings.user.statement_timeout),
-                server.recv(),
-            )
-            .await
-            {
-                Ok(result) => match result {
-                    Ok(message) => Ok(message),
-                    Err(err) => {
-                        pool.ban(address, BanReason::MessageReceiveFailed, Some(client_stats));
-                        error_response_terminal(
-                            &mut self.write,
-                            &format!("error receiving data from server: {:?}", err),
-                        )
-                        .await?;
-                        Err(err)
-                    }
-                },
-                Err(_) => {
-                    error!(
-                        "Statement timeout while talking to {:?} with user {}",
-                        address, pool.settings.user.username
-                    );
-                    server.mark_bad();
-                    pool.ban(address, BanReason::StatementTimeout, Some(client_stats));
-                    error_response_terminal(&mut self.write, "pool statement timeout").await?;
-                    Err(Error::StatementTimeout)
-                }
-            }
-        } else {
-            match server.recv().await {
+        let statement_timeout = match pool.settings.user.statement_timeout {
+            0 => tokio::time::Duration::MAX,
+            timeout => tokio::time::Duration::from_millis(timeout),
+        };
+
+        match tokio::time::timeout(statement_timeout, server.recv()).await {
+            Ok(result) => match result {
                 Ok(message) => Ok(message),
                 Err(err) => {
                     pool.ban(address, BanReason::MessageReceiveFailed, Some(client_stats));
@@ -1341,6 +1427,16 @@ where
                     .await?;
                     Err(err)
                 }
+            },
+            Err(_) => {
+                error!(
+                    "Statement timeout while talking to {:?} with user {}",
+                    address, pool.settings.user.username
+                );
+                server.mark_bad();
+                pool.ban(address, BanReason::StatementTimeout, Some(client_stats));
+                error_response_terminal(&mut self.write, "pool statement timeout").await?;
+                Err(Error::StatementTimeout)
             }
         }
     }

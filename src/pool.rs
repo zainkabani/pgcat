@@ -15,7 +15,7 @@ use std::sync::{
     Arc,
 };
 use std::time::Instant;
-use tokio::sync::Notify;
+use tokio::sync::{broadcast, Notify};
 
 use crate::config::{get_config, Address, General, LoadBalancingMode, PoolMode, Role, User};
 use crate::errors::Error;
@@ -38,6 +38,107 @@ pub type PoolMap = HashMap<PoolIdentifier, ConnectionPool>;
 /// This is atomic and safe and read-optimized.
 /// The pool is recreated dynamically when the config is reloaded.
 pub static POOLS: Lazy<ArcSwap<PoolMap>> = Lazy::new(|| ArcSwap::from_pointee(HashMap::default()));
+
+#[derive(Debug, Default)]
+pub struct InFlightQueryHashMap {
+    map: RwLock<HashMap<String, broadcast::Sender<Result<BytesMut, Error>>>>,
+}
+
+impl InFlightQueryHashMap {
+    pub fn new() -> Self {
+        Self {
+            map: RwLock::new(HashMap::new()),
+        }
+    }
+
+    pub fn insert_into_cache(
+        self: Arc<Self>,
+        query: String,
+        mut driving_client_receiver: broadcast::Receiver<Result<BytesMut, Error>>,
+    ) {
+        let mut write_guard = self.map.write();
+
+        // Create a new channel for new clients that will be waiting for this query
+        let (sender_for_new_clients, _) = broadcast::channel(100); // Consider this number
+        write_guard.insert(query.clone(), sender_for_new_clients);
+        drop(write_guard);
+
+        // This will take messages from the driver and send them to each receiver waiting for a query
+        tokio::spawn(async move {
+            let mut waiting_client_sender: Option<broadcast::Sender<Result<BytesMut, Error>>> =
+                None;
+
+            loop {
+                println!("Waiting for message from driver...");
+                match driving_client_receiver.recv().await {
+                    Ok(message_result) => {
+                        println!("Got message from driver!");
+
+                        // The only way we get this value is when we evict it from the cache
+                        if waiting_client_sender.is_none() {
+                            // We want to evict the query from the cache as soon as we receive the first message from postgres
+                            // We want to avoid sending partial messages in case new clients sign up with the same query and get the partial message
+                            match self.evict_client_waiting_sender(&query) {
+                                Some(s) => {
+                                    println!("Removed query from cache!");
+
+                                    // No need for this tokio task as we don't have any receivers
+                                    if s.receiver_count() == 0 {
+                                        println!("No receivers to send message to!");
+                                        break;
+                                    }
+
+                                    waiting_client_sender = Some(s);
+                                }
+                                None => {
+                                    // We won't be able to send the message to any receivers
+                                    // we shouldn't be able to get here
+                                    println!("Could not find query in cache!");
+                                    break;
+                                }
+                            };
+                        }
+
+                        if let Some(s) = &waiting_client_sender {
+                            println!("Sending message to all receivers!");
+                            let _ = s.send(message_result);
+                            println!("Sent message to all receivers!");
+                        }
+                    }
+                    Err(_) => {
+                        println!("Driver disconnected!");
+                        // Remove the query from the cache if the driver disconnected without sending a message
+                        if waiting_client_sender.is_none() {
+                            println!("Removed query from cache!");
+                            self.evict_client_waiting_sender(&query);
+                        }
+                        break;
+                    }
+                };
+            }
+        });
+    }
+
+    pub fn get_receiver(
+        &self,
+        query: &String,
+    ) -> Option<broadcast::Receiver<Result<BytesMut, Error>>> {
+        let read_guard = self.map.read();
+        if let Some(sender) = read_guard.get(query) {
+            return Some(sender.subscribe());
+        } else {
+            return None;
+        }
+    }
+
+    pub fn evict_client_waiting_sender(
+        &self,
+        query: &String,
+    ) -> Option<broadcast::Sender<Result<BytesMut, Error>>> {
+        let mut write_guard = self.map.write();
+        write_guard.remove(query)
+    }
+}
 
 // Reasons for banning a server.
 #[derive(Debug, PartialEq, Clone)]
@@ -195,6 +296,8 @@ pub struct ConnectionPool {
 
     /// AuthInfo
     pub auth_hash: Arc<RwLock<Option<String>>>,
+
+    pub in_flight_queries_hash_map: Arc<InFlightQueryHashMap>,
 }
 
 impl ConnectionPool {
@@ -416,6 +519,7 @@ impl ConnectionPool {
                     validated: Arc::new(AtomicBool::new(false)),
                     paused: Arc::new(AtomicBool::new(false)),
                     paused_waiter: Arc::new(Notify::new()),
+                    in_flight_queries_hash_map: Arc::new(InFlightQueryHashMap::new()),
                 };
 
                 // Connect to the servers to make sure pool configuration is valid
