@@ -85,6 +85,7 @@ impl InFlightQueryHashMap {
                             }
                             None => {
                                 // We want to evict the query from the cache as soon as we receive the first message from postgres
+                                // We want to avoid sending partial messages in case new clients sign up with the same query and get the partial message
                                 waiting_client_sender = me.evict_client_waiting_sender(&query);
                             },
                         }
