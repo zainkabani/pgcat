@@ -68,15 +68,25 @@ impl InFlightQueryHashMap {
         tokio::spawn(async move {
             let me = Arc::clone(&self);
             let query = my_query;
+
+            let mut waiting_client_sender: Option<broadcast::Sender<Result<BytesMut, Error>>> = None;
+
             loop {
                 println!("Waiting for message from driver...");
                 match driving_client_receiver.recv().await {
                     Ok(message_result) => {
+
                         println!("Got message from driver!");
-                        let read_guard = me.map.read();
-                        if let Some(s) = read_guard.get(&query) {
-                            let _ = s.send(message_result);
-                            println!("Sent message to all receivers!");
+
+                        match &waiting_client_sender {
+                            Some(s) => {
+                                let _ = s.send(message_result);
+                                println!("Sent message to all receivers!");
+                            }
+                            None => {
+                                // We want to evict the query from the cache as soon as we receive the first message from postgres
+                                waiting_client_sender = me.evict_client_waiting_sender(&query);
+                            },
                         }
                     }
                     Err(_) => {
@@ -86,11 +96,11 @@ impl InFlightQueryHashMap {
                 };
             }
 
-            // Remove the query from the cache
-            let mut write_guard = me.map.write();
-            write_guard.remove(&query);
-
-            println!("Removed query from cache!")
+            // Remove the query from the cache if the driver disconnected without sending a message
+            if waiting_client_sender.is_none() {
+                println!("Removed query from cache!");
+                me.evict_client_waiting_sender(&query);
+            }
         });
     }
 
@@ -105,6 +115,11 @@ impl InFlightQueryHashMap {
         } else {
             return None;
         }
+    }
+
+    pub fn evict_client_waiting_sender(&self, query: &String) -> Option<broadcast::Sender<Result<BytesMut, Error>>> {
+        let mut write_guard = self.map.write();
+        write_guard.remove(query)
     }
 }
 
