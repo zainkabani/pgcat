@@ -459,6 +459,12 @@ pub struct Pool {
     pub query_parser_enabled: bool,
 
     #[serde(default)] // False
+    pub infer_shard_enabled: bool,
+
+    #[serde(default)] // False
+    pub infer_role_enabled: bool,
+
+    #[serde(default)] // False
     pub primary_reads_enabled: bool,
 
     pub connect_timeout: Option<u64>,
@@ -588,6 +594,8 @@ impl Default for Pool {
             users: BTreeMap::default(),
             default_role: String::from("any"),
             query_parser_enabled: false,
+            infer_shard_enabled: false,
+            infer_role_enabled: false,
             primary_reads_enabled: false,
             sharding_function: ShardingFunction::PgBigintHash,
             automatic_sharding_key: None,
@@ -761,6 +769,14 @@ impl From<&Config> for std::collections::HashMap<String, String> {
                         pool.query_parser_enabled.to_string(),
                     ),
                     (
+                        format!("pools.{}.infer_shard_enabled", pool_name),
+                        pool.infer_shard_enabled.to_string(),
+                    ),
+                    (
+                        format!("pools.{}.infer_role_enabled", pool_name),
+                        pool.infer_role_enabled.to_string(),
+                    ),
+                    (
                         format!("pools.{}.default_role", pool_name),
                         pool.default_role.clone(),
                     ),
@@ -926,6 +942,14 @@ impl Config {
             info!(
                 "[pool: {}] Query router: {}",
                 pool_name, pool_config.query_parser_enabled
+            );
+            info!(
+                "[pool: {}] Query router (shards): {}",
+                pool_name, pool_config.infer_shard_enabled
+            );
+            info!(
+                "[pool: {}] Query router (role): {}",
+                pool_name, pool_config.infer_role_enabled
             );
             info!(
                 "[pool: {}] Number of shards: {}",

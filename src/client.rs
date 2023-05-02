@@ -800,6 +800,13 @@ where
                 message_result = read_message(&mut self.read) => message_result?
             };
 
+            // Handle admin database queries.
+            if self.admin {
+                debug!("Handling admin command");
+                handle_admin(&mut self.write, message, self.client_server_map.clone()).await?;
+                continue;
+            }
+
             match message[0] as char {
                 // Buffer extended protocol messages even if we do not have
                 // a server connection yet. Hopefully, when we get the S message
@@ -814,17 +821,13 @@ where
                 }
 
                 'Q' => {
-                    if query_router.query_parser_enabled() {
-                        query_router.infer(&message);
-                    }
+                    query_router.parse_query(&message);
                 }
 
                 'P' => {
                     self.buffer.put(&message[..]);
 
-                    if query_router.query_parser_enabled() {
-                        query_router.infer(&message);
-                    }
+                    query_router.parse_query(&message);
 
                     continue;
                 }
@@ -832,9 +835,7 @@ where
                 'B' => {
                     self.buffer.put(&message[..]);
 
-                    if query_router.query_parser_enabled() {
-                        query_router.infer_shard_from_bind(&message);
-                    }
+                    query_router.infer_shard_from_bind(&message);
 
                     continue;
                 }
@@ -848,13 +849,6 @@ where
                 }
 
                 _ => (),
-            }
-
-            // Handle admin database queries.
-            if self.admin {
-                debug!("Handling admin command");
-                handle_admin(&mut self.write, message, self.client_server_map.clone()).await?;
-                continue;
             }
 
             // Get a pool instance referenced by the most up-to-date
