@@ -1,10 +1,12 @@
 use crate::errors::{ClientIdentifier, Error};
+use crate::messages::{BytesMutReader, *};
 use crate::pool::BanReason;
 /// Handle clients by pretending to be a PostgreSQL server.
 use bytes::{Buf, BufMut, BytesMut};
 use log::{debug, error, info, trace, warn};
 use once_cell::sync::Lazy;
 use std::collections::HashMap;
+use std::io::Cursor;
 use std::sync::{atomic::AtomicUsize, Arc};
 use std::time::Instant;
 use tokio::io::{split, AsyncReadExt, BufReader, ReadHalf, WriteHalf};
@@ -18,7 +20,6 @@ use crate::config::{
     get_config, get_idle_client_in_transaction_timeout, get_prepared_statements, Address, PoolMode,
 };
 use crate::constants::*;
-use crate::messages::*;
 use crate::plugins::PluginOutput;
 use crate::pool::{get_pool, ClientServerMap, ConnectionPool};
 use crate::query_router::{Command, QueryRouter};
@@ -1045,6 +1046,28 @@ where
                 }
             };
 
+            let mut initialized_inflight_query = if pool.in_flight_queries_hash_map.enabled {
+                if message[0] as char == 'Q' {
+                    let mut message_cursor = Cursor::new(&message);
+
+                    let _code = message_cursor.get_u8() as char;
+                    let _len = message_cursor.get_i32() as usize;
+
+                    let query = message_cursor.read_string().unwrap();
+
+                    let inflight_hashmap = pool.in_flight_queries_hash_map.clone();
+                    if inflight_hashmap.insert_into_cache(&query) {
+                        Some(query.clone())
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
             debug!("Waiting for connection from pool");
             if !self.admin {
                 self.stats.waiting();
@@ -1290,6 +1313,7 @@ where
                             &address,
                             &pool,
                             &self.stats.clone(),
+                            &mut initialized_inflight_query,
                         )
                         .await?;
 
@@ -1439,6 +1463,7 @@ where
                             &address,
                             &pool,
                             &self.stats.clone(),
+                            &mut None,
                         )
                         .await?;
 
@@ -1668,6 +1693,7 @@ where
         address: &Address,
         pool: &ConnectionPool,
         client_stats: &ClientStats,
+        initialized_inflight_query: &mut Option<String>,
     ) -> Result<(), Error> {
         debug!("Sending {} to server", code);
 
@@ -1686,6 +1712,15 @@ where
             let response = self
                 .receive_server_message(server, address, pool, client_stats)
                 .await?;
+
+            // We want to evict the query from the cache as soon as the server responds with the first message
+            match initialized_inflight_query.take() {
+                Some(query) => {
+                    let inflight_hashmap = pool.in_flight_queries_hash_map.clone();
+                    inflight_hashmap.evict_from_cache(&query);
+                }
+                None => (),
+            }
 
             match write_all_flush(&mut self.write, &response).await {
                 Ok(_) => (),

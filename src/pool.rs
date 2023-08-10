@@ -4,11 +4,12 @@ use bb8::{ManageConnection, Pool, PooledConnection, QueueStrategy};
 use bytes::{BufMut, BytesMut};
 use chrono::naive::NaiveDateTime;
 use log::{debug, error, info, warn};
-use once_cell::sync::Lazy;
+use once_cell::sync::{Lazy, OnceCell};
 use parking_lot::{Mutex, RwLock};
 use rand::seq::SliceRandom;
 use rand::thread_rng;
 use regex::Regex;
+use rustc_hash::FxHashMap;
 use std::collections::HashMap;
 use std::fmt::{Display, Formatter};
 use std::sync::{
@@ -19,7 +20,8 @@ use std::time::Instant;
 use tokio::sync::Notify;
 
 use crate::config::{
-    get_config, Address, General, LoadBalancingMode, Plugins, PoolMode, Role, User,
+    get_config, Address, General, InflightQueryCacheConfig, LoadBalancingMode, Plugins, PoolMode,
+    Role, User,
 };
 use crate::errors::Error;
 
@@ -42,6 +44,96 @@ pub type PoolMap = HashMap<PoolIdentifier, ConnectionPool>;
 /// This is atomic and safe and read-optimized.
 /// The pool is recreated dynamically when the config is reloaded.
 pub static POOLS: Lazy<ArcSwap<PoolMap>> = Lazy::new(|| ArcSwap::from_pointee(HashMap::default()));
+
+const INFLIGHT_QUERY_IGNORE_STATEMENT_REGEX_PATTERN: &str =
+    r"(?i)\b(BEGIN|START\s+TRANSACTION)\b\s*;";
+static INFLIGHT_QUERY_IGNORE_STATEMENT_REGEX: OnceCell<Regex> = OnceCell::new();
+
+#[derive(Debug, Default)]
+pub struct InFlightQueryHashMap {
+    pub enabled: bool,
+    map: RwLock<FxHashMap<String, u32>>,
+    max_entries: usize,
+    log_normalized_queries: bool,
+}
+
+impl InFlightQueryHashMap {
+    pub fn new(mut inflight_query_cache_config: InflightQueryCacheConfig) -> Self {
+        match Regex::new(&INFLIGHT_QUERY_IGNORE_STATEMENT_REGEX_PATTERN) {
+            Ok(regex) => match INFLIGHT_QUERY_IGNORE_STATEMENT_REGEX.set(regex) {
+                Ok(_) => {}
+                Err(e) => {
+                    warn!("Failed to set regex: {}. Disabling", e);
+                    inflight_query_cache_config.track_metrics = false;
+                }
+            },
+            Err(e) => {
+                warn!("Failed to compile regex: {}. Disabling", e);
+                inflight_query_cache_config.track_metrics = false;
+            }
+        };
+
+        Self {
+            enabled: inflight_query_cache_config.track_metrics,
+            map: RwLock::new(FxHashMap::default()),
+            max_entries: inflight_query_cache_config.max_entries,
+            log_normalized_queries: inflight_query_cache_config.log_normalized_queries,
+        }
+    }
+
+    /// Check if the query is in the cache
+    /// If we added the query to the cache, return true otherwise false
+    pub fn insert_into_cache(self: Arc<Self>, query: &String) -> bool {
+        // Check to see if this is a statement that we want to ignore
+        let my_regex = INFLIGHT_QUERY_IGNORE_STATEMENT_REGEX.get().unwrap();
+        if my_regex.is_match(query) {
+            println!("IGNORING QUERY: {}", query);
+            return false;
+        } else {
+            println!("NOT IGNORING QUERY: {}", query);
+        }
+
+        let mut write_guard = self.map.write();
+
+        let mut added_new_entry_to_cache = true;
+
+        if write_guard.len() > self.max_entries {
+            warn!("Inflight query cache is getting too big, skipping it");
+            return false;
+        }
+
+        write_guard
+            .entry(query.clone())
+            .and_modify(|value| {
+                added_new_entry_to_cache = false;
+                *value += 1
+            })
+            .or_insert(0);
+
+        return added_new_entry_to_cache;
+    }
+
+    pub fn evict_from_cache(&self, query: &String) {
+        let mut write_guard = self.map.write();
+        // clear and get the value
+        match write_guard.remove(query) {
+            Some(value) => {
+                if value > 0 {
+                    let mut q = "".to_string();
+
+                    if self.log_normalized_queries {
+                        if let Ok(normalized) = pg_query::normalize(&query) {
+                            q = format!(": {}", normalized);
+                        }
+                    }
+
+                    info!("Got an inflight query which was hit {} times{}", value, q);
+                }
+            }
+            None => {}
+        }
+    }
+}
 
 // Reasons for banning a server.
 #[derive(Debug, PartialEq, Clone)]
@@ -216,6 +308,9 @@ pub struct ConnectionPool {
     /// If the pool has been paused or not.
     paused: Arc<AtomicBool>,
     paused_waiter: Arc<Notify>,
+
+    /// Hash map of in-flight queries
+    pub in_flight_queries_hash_map: Arc<InFlightQueryHashMap>,
 
     /// AuthInfo
     pub auth_hash: Arc<RwLock<Option<String>>>,
@@ -440,6 +535,11 @@ impl ConnectionPool {
                     );
                 }
 
+                let inflight_query_cache_config = match pool_config.inflight_query_cache {
+                    Some(inflight_query_cache_config) => inflight_query_cache_config,
+                    None => InflightQueryCacheConfig::default(),
+                };
+
                 let pool = ConnectionPool {
                     databases: shards,
                     addresses,
@@ -493,6 +593,9 @@ impl ConnectionPool {
                     validated: Arc::new(AtomicBool::new(false)),
                     paused: Arc::new(AtomicBool::new(false)),
                     paused_waiter: Arc::new(Notify::new()),
+                    in_flight_queries_hash_map: Arc::new(InFlightQueryHashMap::new(
+                        inflight_query_cache_config,
+                    )),
                 };
 
                 // Connect to the servers to make sure pool configuration is valid
