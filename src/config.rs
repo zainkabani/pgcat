@@ -675,6 +675,20 @@ impl Pool {
             return Err(Error::BadConfig);
         }
 
+        // Can't have inflight caching enabled on non-replica instances
+        if self.inflight_query_cache.is_some() {
+            for shard in self.shards.values() {
+                for server in &shard.servers {
+                    if server.role != Role::Replica {
+                        error!(
+                            "inflight_query_cache is only valid when all servers have role 'replica'"
+                        );
+                        return Err(Error::BadConfig);
+                    }
+                }
+            }
+        }
+
         self.automatic_sharding_key = match &self.automatic_sharding_key {
             Some(key) => {
                 // No quotes in the key so we don't have to compare quoted
