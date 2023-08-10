@@ -81,12 +81,9 @@ impl InFlightQueryHashMap {
     /// If we added the query to the cache, return true otherwise false
     pub fn insert_into_cache(self: Arc<Self>, query: &String) -> bool {
         // Check to see if this is a statement that we want to ignore
-        let my_regex = INFLIGHT_QUERY_IGNORE_STATEMENT_REGEX.get().unwrap();
-        if my_regex.is_match(query) {
-            println!("IGNORING QUERY: {}", query);
+        let inflight_query_ignore_statement_regex = INFLIGHT_QUERY_IGNORE_STATEMENT_REGEX.get().unwrap();
+        if inflight_query_ignore_statement_regex.is_match(query) {
             return false;
-        } else {
-            println!("NOT IGNORING QUERY: {}", query);
         }
 
         let mut write_guard = self.map.write();
