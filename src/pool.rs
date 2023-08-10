@@ -46,7 +46,7 @@ pub type PoolMap = HashMap<PoolIdentifier, ConnectionPool>;
 pub static POOLS: Lazy<ArcSwap<PoolMap>> = Lazy::new(|| ArcSwap::from_pointee(HashMap::default()));
 
 const INFLIGHT_QUERY_IGNORE_STATEMENT_REGEX_PATTERN: &str =
-    r"(?i)\b(BEGIN|START\s+TRANSACTION)\b\s*;";
+    r"(?i)\b(BEGIN|START\s+TRANSACTION)\b\s*";
 static INFLIGHT_QUERY_IGNORE_STATEMENT_REGEX: OnceCell<Regex> = OnceCell::new();
 
 #[derive(Debug, Default)]
@@ -60,13 +60,9 @@ pub struct InFlightQueryHashMap {
 impl InFlightQueryHashMap {
     pub fn new(mut inflight_query_cache_config: InflightQueryCacheConfig) -> Self {
         match Regex::new(&INFLIGHT_QUERY_IGNORE_STATEMENT_REGEX_PATTERN) {
-            Ok(regex) => match INFLIGHT_QUERY_IGNORE_STATEMENT_REGEX.set(regex) {
-                Ok(_) => {}
-                Err(e) => {
-                    warn!("Failed to set regex: {}. Disabling", e);
-                    inflight_query_cache_config.track_metrics = false;
-                }
-            },
+            Ok(regex) => {
+                let _ = INFLIGHT_QUERY_IGNORE_STATEMENT_REGEX.set(regex);
+            }
             Err(e) => {
                 warn!("Failed to compile regex: {}. Disabling", e);
                 inflight_query_cache_config.track_metrics = false;
