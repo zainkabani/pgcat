@@ -548,8 +548,6 @@ pub struct Pool {
     #[serde(default)] // False
     pub primary_reads_enabled: bool,
 
-    pub inflight_query_cache: Option<InflightQueryCacheConfig>,
-
     /// Maximum time to allow for establishing a new server connection.
     pub connect_timeout: Option<u64>,
 
@@ -581,6 +579,8 @@ pub struct Pool {
     pub plugins: Option<Plugins>,
     pub shards: BTreeMap<String, Shard>,
     pub users: BTreeMap<String, User>,
+
+    pub inflight_query_cache: Option<InflightQueryCacheConfig>,
     // Note, don't put simple fields below these configs. There's a compatibility issue with TOML that makes it
     // incompatible to have simple fields in TOML after complex objects. See
     // https://users.rust-lang.org/t/why-toml-to-string-get-error-valueaftertable/85903
@@ -714,7 +714,6 @@ impl Default for Pool {
             query_parser_max_length: None,
             query_parser_read_write_splitting: false,
             primary_reads_enabled: false,
-            inflight_query_cache: None,
             sharding_function: ShardingFunction::PgBigintHash,
             automatic_sharding_key: None,
             connect_timeout: None,
@@ -728,6 +727,7 @@ impl Default for Pool {
             server_lifetime: None,
             plugins: None,
             cleanup_server_connections: true,
+            inflight_query_cache: None,
         }
     }
 }
