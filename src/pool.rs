@@ -45,9 +45,9 @@ pub type PoolMap = HashMap<PoolIdentifier, ConnectionPool>;
 /// The pool is recreated dynamically when the config is reloaded.
 pub static POOLS: Lazy<ArcSwap<PoolMap>> = Lazy::new(|| ArcSwap::from_pointee(HashMap::default()));
 
-const INFLIGHT_QUERY_IGNORE_STATEMENT_REGEX_PATTERN: &str =
-    r"(?i)\b(BEGIN|START\s+TRANSACTION)\b\s*";
-static INFLIGHT_QUERY_IGNORE_STATEMENT_REGEX: OnceCell<Regex> = OnceCell::new();
+const INFLIGHT_QUERY_STATEMENT_REGEX_PATTERN: &str =
+    r"(?i)SELECT\s+[\s\S]*\s+FROM\s+[\s\S]*";
+static INFLIGHT_QUERY_STATEMENT_REGEX: OnceCell<Regex> = OnceCell::new();
 
 #[derive(Debug, Default)]
 pub struct InFlightQueryHashMap {
@@ -59,9 +59,9 @@ pub struct InFlightQueryHashMap {
 
 impl InFlightQueryHashMap {
     pub fn new(mut inflight_query_cache_config: InflightQueryCacheConfig) -> Self {
-        match Regex::new(&INFLIGHT_QUERY_IGNORE_STATEMENT_REGEX_PATTERN) {
+        match Regex::new(&INFLIGHT_QUERY_STATEMENT_REGEX_PATTERN) {
             Ok(regex) => {
-                let _ = INFLIGHT_QUERY_IGNORE_STATEMENT_REGEX.set(regex);
+                let _ = INFLIGHT_QUERY_STATEMENT_REGEX.set(regex);
             }
             Err(e) => {
                 warn!("Failed to compile regex: {}. Disabling", e);
@@ -81,8 +81,8 @@ impl InFlightQueryHashMap {
     /// If we added the query to the cache, return true otherwise false
     pub fn insert_into_cache(self: Arc<Self>, query: &String) -> bool {
         // Check to see if this is a statement that we want to ignore
-        let inflight_query_ignore_statement_regex = INFLIGHT_QUERY_IGNORE_STATEMENT_REGEX.get().unwrap();
-        if inflight_query_ignore_statement_regex.is_match(query) {
+        let inflight_query_ignore_statement_regex = INFLIGHT_QUERY_STATEMENT_REGEX.get().unwrap();
+        if !inflight_query_ignore_statement_regex.is_match(query) {
             return false;
         }
 
