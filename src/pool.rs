@@ -44,9 +44,11 @@ pub type PoolMap = HashMap<PoolIdentifier, ConnectionPool>;
 /// The pool is recreated dynamically when the config is reloaded.
 pub static POOLS: Lazy<ArcSwap<PoolMap>> = Lazy::new(|| ArcSwap::from_pointee(HashMap::default()));
 
-const INFLIGHT_QUERY_STATEMENT_REGEX_PATTERN: &str =
-    r"(?i)SELECT\s+[\s\S]*\s+FROM\s+[\s\S]*";
+const INFLIGHT_QUERY_STATEMENT_REGEX_PATTERN: &str = r"(?i)SELECT\s+[\s\S]*\s+FROM\s+[\s\S]*";
+const PG_COMMENT_REGEX_PATTERN: &str = r"(?m)--[^\n]*|\/\*[^*]*\*\/";
+
 static INFLIGHT_QUERY_STATEMENT_REGEX: OnceCell<Regex> = OnceCell::new();
+static PG_COMMENT_REGEX: OnceCell<Regex> = OnceCell::new();
 
 #[derive(Debug, Default)]
 pub struct InFlightQueryHashMap {
@@ -67,6 +69,16 @@ impl InFlightQueryHashMap {
                 inflight_query_cache_config.track_metrics = false;
             }
         };
+
+        match Regex::new(&PG_COMMENT_REGEX_PATTERN) {
+            Ok(regex) => {
+                let _ = PG_COMMENT_REGEX.set(regex);
+            }
+            Err(e) => {
+                warn!("Failed to compile regex: {}. Disabling", e);
+                inflight_query_cache_config.track_metrics = false;
+            }
+        }
 
         Self {
             enabled: inflight_query_cache_config.track_metrics,
@@ -94,8 +106,11 @@ impl InFlightQueryHashMap {
             return false;
         }
 
+        let pg_comment_regex = PG_COMMENT_REGEX.get().unwrap();
+        let query = pg_comment_regex.replace_all(query, "");
+
         write_guard
-            .entry(query.clone())
+            .entry(query.to_string())
             .and_modify(|value| {
                 added_new_entry_to_cache = false;
                 *value += 1
