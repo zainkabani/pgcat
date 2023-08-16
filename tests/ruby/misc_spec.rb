@@ -221,7 +221,7 @@ describe "Miscellaneous" do
         conn.close
       end
 
-      it "Does not send DISCARD ALL unless necessary" do
+      it "Does not send RESET ALL unless necessary" do
         10.times do
           conn = PG::connect(processes.pgcat.connection_string("sharded_db", "sharding_user"))
           conn.async_exec("SET SERVER ROLE to 'primary'")
@@ -229,7 +229,7 @@ describe "Miscellaneous" do
           conn.close
         end
 
-        expect(processes.primary.count_query("DISCARD ALL")).to eq(0)
+        expect(processes.primary.count_query("RESET ALL")).to eq(0)
 
         10.times do
           conn = PG::connect(processes.pgcat.connection_string("sharded_db", "sharding_user"))
@@ -239,7 +239,7 @@ describe "Miscellaneous" do
           conn.close
         end
 
-        expect(processes.primary.count_query("DISCARD ALL")).to eq(10)
+        expect(processes.primary.count_query("RESET ALL")).to eq(10)
       end
 
       it "Resets server roles correctly" do
@@ -273,7 +273,7 @@ describe "Miscellaneous" do
         end
       end
 
-      it "Does not send DISCARD ALL unless necessary" do
+      it "Does not send RESET ALL unless necessary" do
         10.times do
           conn = PG::connect(processes.pgcat.connection_string("sharded_db", "sharding_user"))
           conn.async_exec("SET SERVER ROLE to 'primary'")
@@ -282,7 +282,7 @@ describe "Miscellaneous" do
           conn.close
         end
 
-        expect(processes.primary.count_query("DISCARD ALL")).to eq(0)
+        expect(processes.primary.count_query("RESET ALL")).to eq(0)
 
         10.times do
           conn = PG::connect(processes.pgcat.connection_string("sharded_db", "sharding_user"))
@@ -292,8 +292,32 @@ describe "Miscellaneous" do
           conn.close
         end
 
-        expect(processes.primary.count_query("DISCARD ALL")).to eq(10)
+        expect(processes.primary.count_query("RESET ALL")).to eq(10)
       end
+
+      it "Respects tracked parameters on startup" do
+        conn = PG::connect(processes.pgcat.connection_string("sharded_db", "sharding_user", parameters: { "application_name" => "my_pgcat_test" }))
+
+        expect(conn.async_exec("SHOW application_name")[0]["application_name"]).to eq("my_pgcat_test")
+        conn.close
+      end
+
+      it "Respect tracked parameter on set statemet" do
+        conn = PG::connect(processes.pgcat.connection_string("sharded_db", "sharding_user"))
+
+        conn.async_exec("SET application_name to 'my_pgcat_test'")
+        expect(conn.async_exec("SHOW application_name")[0]["application_name"]).to eq("my_pgcat_test")
+      end
+
+
+      it "Ignore untracked parameter on set statemet" do
+        conn = PG::connect(processes.pgcat.connection_string("sharded_db", "sharding_user"))
+        orignal_statement_timeout = conn.async_exec("SHOW statement_timeout")[0]["statement_timeout"]
+
+        conn.async_exec("SET statement_timeout to 1500")
+        expect(conn.async_exec("SHOW statement_timeout")[0]["statement_timeout"]).to eq(orignal_statement_timeout)
+      end
+ 
     end
 
     context "transaction mode with transactions" do
@@ -307,7 +331,7 @@ describe "Miscellaneous" do
           conn.async_exec("COMMIT")
           conn.close
         end
-        expect(processes.primary.count_query("DISCARD ALL")).to eq(0)
+        expect(processes.primary.count_query("RESET ALL")).to eq(0)
 
         10.times do
           conn = PG::connect(processes.pgcat.connection_string("sharded_db", "sharding_user"))
@@ -317,7 +341,7 @@ describe "Miscellaneous" do
           conn.async_exec("COMMIT")
           conn.close
         end
-        expect(processes.primary.count_query("DISCARD ALL")).to eq(0)
+        expect(processes.primary.count_query("RESET ALL")).to eq(0)
       end
     end
 
@@ -331,7 +355,7 @@ describe "Miscellaneous" do
         conn.close
 
         puts processes.pgcat.logs
-        expect(processes.primary.count_query("DISCARD ALL")).to eq(0)
+        expect(processes.primary.count_query("RESET ALL")).to eq(0)
       end
 
       it "will not clean up prepared statements" do
@@ -342,7 +366,7 @@ describe "Miscellaneous" do
         conn.close
 
         puts processes.pgcat.logs
-        expect(processes.primary.count_query("DISCARD ALL")).to eq(0)
+        expect(processes.primary.count_query("RESET ALL")).to eq(0)
       end
     end
   end

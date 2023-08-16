@@ -41,6 +41,7 @@ impl MirroredClient {
             Arc::new(RwLock::new(None)),
             None,
             true,
+            false,
         );
 
         Pool::builder()
@@ -78,7 +79,7 @@ impl MirroredClient {
                     }
 
                     // Incoming data from server (we read to clear the socket buffer and discard the data)
-                    recv_result = server.recv() => {
+                    recv_result = server.recv(None) => {
                         match recv_result {
                             Ok(message) => trace!("Received from mirror: {} {:?}", String::from_utf8_lossy(&message[..]), address.clone()),
                             Err(err) => {
