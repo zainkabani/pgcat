@@ -52,6 +52,7 @@ const PG_COMMENT_REGEX_PATTERN: &str = r"(?m)--[^\n]*|\/\*[^*]*\*\/";
 static INFLIGHT_QUERY_STATEMENT_REGEX: OnceCell<Regex> = OnceCell::new();
 static PG_COMMENT_REGEX: OnceCell<Regex> = OnceCell::new();
 
+#[derive(Debug)]
 pub struct ExtendedProtocolQueryData {
     parse_query: String,
     bind_message_bytes: BytesMut,
@@ -70,6 +71,7 @@ impl ExtendedProtocolQueryData {
     }
 }
 
+#[derive(Debug)]
 pub enum InflightQueryData {
     Simple(String),
     Extended(ExtendedProtocolQueryData),
