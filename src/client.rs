@@ -1,6 +1,6 @@
 use crate::errors::{ClientIdentifier, Error};
 use crate::messages::{BytesMutReader, *};
-use crate::pool::BanReason;
+use crate::pool::{BanReason, ExtendedProtocolQueryData, InflightQueryData};
 /// Handle clients by pretending to be a PostgreSQL server.
 use bytes::{Buf, BufMut, BytesMut};
 use log::{debug, error, info, trace, warn};
@@ -53,6 +53,9 @@ pub struct Client<S, T> {
     /// Internal buffer, where we place messages until we have to flush
     /// them to the backend.
     buffer: BytesMut,
+
+    /// Data about the current in-flight query
+    inflight_query_data: Option<InflightQueryData>,
 
     /// Address
     addr: std::net::SocketAddr,
@@ -682,6 +685,7 @@ where
             write,
             addr,
             buffer: BytesMut::with_capacity(8196),
+            inflight_query_data: None,
             cancel_mode: false,
             transaction_mode,
             process_id,
@@ -717,6 +721,7 @@ where
             write,
             addr,
             buffer: BytesMut::with_capacity(8196),
+            inflight_query_data: None,
             cancel_mode: true,
             transaction_mode: false,
             process_id,
@@ -904,6 +909,17 @@ where
                             }
                         }
                     }
+
+                    if pool.in_flight_queries_hash_map.enabled {
+                        let mut message_cursor = Cursor::new(&message);
+
+                        let _code = message_cursor.get_u8() as char;
+                        let _len = message_cursor.get_i32() as usize;
+
+                        let query = message_cursor.read_string().unwrap(); // TODO: Handle
+
+                        self.inflight_query_data = Some(InflightQueryData::Simple(query));
+                    }
                 }
 
                 'P' => {
@@ -913,6 +929,20 @@ where
                     }
 
                     self.buffer.put(&message[..]);
+
+                    if pool.in_flight_queries_hash_map.enabled {
+                        let mut message_cursor = Cursor::new(&message);
+
+                        let _code = message_cursor.get_u8() as char;
+                        let _len = message_cursor.get_i32() as usize;
+                        let _name = message_cursor.read_string().unwrap(); // TODO: Handle
+
+                        let query = message_cursor.read_string().unwrap(); // TODO: Handle
+
+                        self.inflight_query_data = Some(InflightQueryData::Extended(
+                            ExtendedProtocolQueryData::new_with_parse(query),
+                        ));
+                    }
 
                     if query_router.query_parser_enabled() {
                         match query_router.parse(&message) {
@@ -942,6 +972,27 @@ where
 
                     self.buffer.put(&message[..]);
 
+                    if pool.in_flight_queries_hash_map.enabled {
+                        let mut message_cursor = Cursor::new(&message);
+
+                        let _code = message_cursor.get_u8() as char;
+                        let _len = message_cursor.get_i32() as usize;
+
+                        let _portal = message_cursor.read_string().unwrap();
+                        let _statement = message_cursor.read_string().unwrap();
+
+                        // We just care to compare that the query and parameter metadata parts are stored so we don't actually care about details of this
+                        let remaining_bytes =
+                            BytesMut::from(&message[message_cursor.position() as usize..]);
+
+                        if let Some(InflightQueryData::Extended(
+                            ref mut extended_protocol_query_data,
+                        )) = self.inflight_query_data
+                        {
+                            extended_protocol_query_data.set_bind(remaining_bytes);
+                        }
+                    }
+
                     if query_router.query_parser_enabled() {
                         query_router.infer_shard_from_bind(&message);
                     }
@@ -969,6 +1020,7 @@ where
             match plugin_output {
                 Some(PluginOutput::Deny(error)) => {
                     self.buffer.clear();
+                    self.inflight_query_data.take();
                     error_response(&mut self.write, &error).await?;
                     plugin_output = None;
                     continue;
@@ -1053,22 +1105,11 @@ where
             };
 
             let mut initialized_inflight_query = if pool.in_flight_queries_hash_map.enabled {
-                if message[0] as char == 'Q' {
-                    let mut message_cursor = Cursor::new(&message);
+                let inflight_hashmap = pool.in_flight_queries_hash_map.clone();
 
-                    let _code = message_cursor.get_u8() as char;
-                    let _len = message_cursor.get_i32() as usize;
-
-                    let query = message_cursor.read_string().unwrap();
-
-                    let inflight_hashmap = pool.in_flight_queries_hash_map.clone();
-                    if inflight_hashmap.insert_into_cache(&query) {
-                        Some(query.clone())
-                    } else {
-                        None
-                    }
-                } else {
-                    None
+                match self.inflight_query_data.take() {
+                    Some(query_data) => inflight_hashmap.insert_into_cache(query_data),
+                    None => None,
                 }
             } else {
                 None
@@ -1098,6 +1139,7 @@ where
                     if message[0] as char == 'S' {
                         error!("Got Sync message but failed to get a connection from the pool");
                         self.buffer.clear();
+                        self.inflight_query_data.take();
                     }
 
                     error_response(&mut self.write, "could not get connection from the pool")
@@ -1430,6 +1472,7 @@ where
                                 error_response(&mut self.write, &error).await?;
                                 plugin_output = None;
                                 self.buffer.clear();
+                                self.inflight_query_data.take();
                                 continue;
                             }
 
@@ -1437,6 +1480,7 @@ where
                                 write_all(&mut self.write, result).await?;
                                 plugin_output = None;
                                 self.buffer.clear();
+                                self.inflight_query_data.take();
                                 continue;
                             }
 
@@ -1468,11 +1512,12 @@ where
                             &address,
                             &pool,
                             &self.stats.clone(),
-                            &mut None,
+                            &mut initialized_inflight_query,
                         )
                         .await?;
 
                         self.buffer.clear();
+                        self.inflight_query_data.take();
 
                         if !server.in_transaction() {
                             self.stats.transaction();

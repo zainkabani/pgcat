@@ -1,6 +1,7 @@
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use bb8::{ManageConnection, Pool, PooledConnection, QueueStrategy};
+use bytes::BytesMut;
 use chrono::naive::NaiveDateTime;
 use log::{debug, error, info, warn};
 use once_cell::sync::{Lazy, OnceCell};
@@ -11,6 +12,7 @@ use regex::Regex;
 use rustc_hash::FxHashMap;
 use std::collections::HashMap;
 use std::fmt::{Display, Formatter};
+use std::str;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
@@ -49,6 +51,60 @@ const PG_COMMENT_REGEX_PATTERN: &str = r"(?m)--[^\n]*|\/\*[^*]*\*\/";
 
 static INFLIGHT_QUERY_STATEMENT_REGEX: OnceCell<Regex> = OnceCell::new();
 static PG_COMMENT_REGEX: OnceCell<Regex> = OnceCell::new();
+
+pub struct ExtendedProtocolQueryData {
+    parse_query: String,
+    bind_message_bytes: BytesMut,
+}
+
+impl ExtendedProtocolQueryData {
+    pub fn new_with_parse(parse_query: String) -> Self {
+        Self {
+            parse_query,
+            bind_message_bytes: BytesMut::new(),
+        }
+    }
+
+    pub fn set_bind(&mut self, bind_message_bytes: BytesMut) {
+        self.bind_message_bytes = bind_message_bytes;
+    }
+}
+
+pub enum InflightQueryData {
+    Simple(String),
+    Extended(ExtendedProtocolQueryData),
+}
+
+impl InflightQueryData {
+    pub fn get_string(&self) -> String {
+        match self {
+            InflightQueryData::Simple(s) => s.clone(),
+            InflightQueryData::Extended(e) => {
+                format!(
+                    "{} {}",
+                    e.parse_query,
+                    String::from_utf8_lossy(&e.bind_message_bytes).to_string()
+                )
+            }
+        }
+    }
+
+    pub fn sanitize_query_string(&mut self) {
+        match self {
+            InflightQueryData::Simple(s) => {
+                *s = Self::_sanitize_query_string(s);
+            }
+            InflightQueryData::Extended(e) => {
+                e.parse_query = Self::_sanitize_query_string(&e.parse_query);
+            }
+        }
+    }
+
+    fn _sanitize_query_string(query_string: &str) -> String {
+        let pg_comment_regex = PG_COMMENT_REGEX.get().unwrap();
+        pg_comment_regex.replace_all(query_string, "").to_string()
+    }
+}
 
 #[derive(Debug, Default)]
 pub struct InFlightQueryHashMap {
@@ -90,29 +146,35 @@ impl InFlightQueryHashMap {
 
     /// Check if the query is in the cache
     /// If we added the query to the cache, return true otherwise false
-    pub fn insert_into_cache(self: Arc<Self>, query: &String) -> bool {
+    pub fn insert_into_cache(self: Arc<Self>, mut query_data: InflightQueryData) -> Option<String> {
+        let query_string = match query_data {
+            InflightQueryData::Simple(ref s) => s,
+            InflightQueryData::Extended(ref e) => &e.parse_query,
+        };
+
         // Check to see if this is a statement that we want to ignore
         let inflight_query_ignore_statement_regex = INFLIGHT_QUERY_STATEMENT_REGEX.get().unwrap();
-        if !inflight_query_ignore_statement_regex.is_match(query) {
-            return false;
+        if !inflight_query_ignore_statement_regex.is_match(&query_string) {
+            return None;
         }
 
         let mut write_guard = self.map.write();
 
-        let mut added_new_entry_to_cache = true;
-
         if write_guard.len() > self.max_entries {
             warn!("Inflight query cache is getting too big, skipping it");
-            return false;
+            return None;
         }
 
-        let pg_comment_regex = PG_COMMENT_REGEX.get().unwrap();
-        let query = pg_comment_regex.replace_all(query, "");
+        query_data.sanitize_query_string();
+
+        let query = query_data.get_string();
+
+        let mut added_new_entry_to_cache = Some(query.clone());
 
         write_guard
-            .entry(query.to_string())
+            .entry(query)
             .and_modify(|value| {
-                added_new_entry_to_cache = false;
+                added_new_entry_to_cache = None;
                 *value += 1
             })
             .or_insert(0);
