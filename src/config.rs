@@ -497,6 +497,35 @@ impl ToString for LoadBalancingMode {
     }
 }
 
+// Struct for configuring the inflight_query_cache
+#[derive(Serialize, Deserialize, Debug, Copy, Clone, PartialEq, Eq, Hash)]
+pub struct InflightQueryCacheConfig {
+    #[serde(default)] // False
+    pub track_metrics: bool,
+
+    #[serde(default = "InflightQueryCacheConfig::default_max_entries")]
+    pub max_entries: usize,
+
+    #[serde(default)] // False
+    pub log_normalized_queries: bool,
+}
+
+impl Default for InflightQueryCacheConfig {
+    fn default() -> InflightQueryCacheConfig {
+        InflightQueryCacheConfig {
+            track_metrics: false,
+            max_entries: Self::default_max_entries(),
+            log_normalized_queries: false,
+        }
+    }
+}
+
+impl InflightQueryCacheConfig {
+    pub fn default_max_entries() -> usize {
+        1000
+    }
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Pool {
     #[serde(default = "Pool::default_pool_mode")]
@@ -553,6 +582,8 @@ pub struct Pool {
     pub plugins: Option<Plugins>,
     pub shards: BTreeMap<String, Shard>,
     pub users: BTreeMap<String, User>,
+
+    pub inflight_query_cache: Option<InflightQueryCacheConfig>,
     // Note, don't put simple fields below these configs. There's a compatibility issue with TOML that makes it
     // incompatible to have simple fields in TOML after complex objects. See
     // https://users.rust-lang.org/t/why-toml-to-string-get-error-valueaftertable/85903
@@ -647,6 +678,20 @@ impl Pool {
             return Err(Error::BadConfig);
         }
 
+        // Can't have inflight caching enabled on non-replica instances
+        if self.inflight_query_cache.is_some() {
+            for shard in self.shards.values() {
+                for server in &shard.servers {
+                    if server.role != Role::Replica {
+                        error!(
+                            "inflight_query_cache is only valid when all servers have role 'replica'"
+                        );
+                        return Err(Error::BadConfig);
+                    }
+                }
+            }
+        }
+
         self.automatic_sharding_key = match &self.automatic_sharding_key {
             Some(key) => {
                 // No quotes in the key so we don't have to compare quoted
@@ -699,6 +744,7 @@ impl Default for Pool {
             server_lifetime: None,
             plugins: None,
             cleanup_server_connections: true,
+            inflight_query_cache: None,
             log_client_parameter_status_changes: false,
         }
     }
@@ -934,6 +980,34 @@ impl From<&Config> for std::collections::HashMap<String, String> {
                         pool.primary_reads_enabled.to_string(),
                     ),
                     (
+                        format!("pools.{}.inflight_query_cache.track_metrics", pool_name),
+                        match pool.inflight_query_cache {
+                            Some(cache) => cache.track_metrics.to_string(),
+                            None => InflightQueryCacheConfig::default()
+                                .track_metrics
+                                .to_string(),
+                        },
+                    ),
+                    (
+                        format!("pools.{}.inflight_query_cache.max_entries", pool_name),
+                        match pool.inflight_query_cache {
+                            Some(cache) => cache.max_entries.to_string(),
+                            None => InflightQueryCacheConfig::default().max_entries.to_string(),
+                        },
+                    ),
+                    (
+                        format!(
+                            "pools.{}.inflight_query_cache.log_normalized_queries",
+                            pool_name
+                        ),
+                        match pool.inflight_query_cache {
+                            Some(cache) => cache.log_normalized_queries.to_string(),
+                            None => InflightQueryCacheConfig::default()
+                                .log_normalized_queries
+                                .to_string(),
+                        },
+                    ),
+                    (
                         format!("pools.{}.query_parser_enabled", pool_name),
                         pool.query_parser_enabled.to_string(),
                     ),
@@ -1139,6 +1213,37 @@ impl Config {
                 "[pool: {}] Infer role from query: {}",
                 pool_name, pool_config.query_parser_read_write_splitting
             );
+            info!(
+                "[pool: {}] inflight_query_cache track_metrics: {}",
+                pool_name,
+                match pool_config.inflight_query_cache {
+                    Some(cache) => format!("{}", cache.track_metrics),
+                    None => InflightQueryCacheConfig::default()
+                        .track_metrics
+                        .to_string(),
+                }
+            );
+
+            info!(
+                "[pool: {}] inflight_query_cache max_entries: {}",
+                pool_name,
+                match pool_config.inflight_query_cache {
+                    Some(cache) => format!("{}", cache.max_entries),
+                    None => InflightQueryCacheConfig::default_max_entries().to_string(),
+                }
+            );
+
+            info!(
+                "[pool: {}] inflight_query_cache log_normalized_queries: {}",
+                pool_name,
+                match pool_config.inflight_query_cache {
+                    Some(cache) => format!("{}", cache.log_normalized_queries),
+                    None => InflightQueryCacheConfig::default()
+                        .log_normalized_queries
+                        .to_string(),
+                }
+            );
+
             info!(
                 "[pool: {}] Number of shards: {}",
                 pool_name,
