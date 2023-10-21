@@ -1530,7 +1530,7 @@ mod tests {
                 line: None,
                 routine: None,
             },
-            PgErrorMsg::parse(only_mandatory_msg).unwrap()
+            PgErrorMsg::parse(&only_mandatory_msg).unwrap()
         );
     }
 }
